@@ -168,6 +168,15 @@
         return widget;
     }
 
+    // Map a KeyboardEvent.key value to a chord token understood by the native
+    // keybinding parser (matches keyname_to_vkey in src/macos/src/input.rs).
+    function keybindToken(k) {
+        if (k.indexOf('Arrow') === 0) return k.slice(5); // ArrowLeft -> Left
+        if (k === ' ' || k === 'Spacebar') return 'Space';
+        if (k.length === 1) return k.toUpperCase();
+        return k; // Enter, Tab, F1..F12, Home, End, etc.
+    }
+
     // Populate the settings form with controls driven by window.jmpInfo.
     function buildSettingsForm(form) {
         const jmpInfo = window.jmpInfo;
@@ -241,6 +250,74 @@
                         }
                     });
                     container.appendChild(widget);
+                    if (setting.help) {
+                        const helpText = document.createElement('div');
+                        helpText.className = 'fieldDescription';
+                        helpText.textContent = setting.help;
+                        container.appendChild(helpText);
+                    }
+                } else if (setting.inputType === 'keybind') {
+                    container.className = 'inputContainer';
+                    const labelText = document.createElement('label');
+                    labelText.className = 'inputLabel';
+                    labelText.textContent = setting.displayName;
+                    container.appendChild(labelText);
+
+                    const row = document.createElement('div');
+                    row.style.display = 'flex';
+                    row.style.gap = '8px';
+                    row.style.alignItems = 'center';
+
+                    const control = document.createElement('input');
+                    control.type = 'text';
+                    control.className = 'emby-input';
+                    control.style.flex = '1';
+                    control.value = values[setting.key] || '';
+                    control.placeholder = 'e.g. Cmd+[';
+
+                    const save = () => {
+                        jmpInfo.settings[section][setting.key] = control.value;
+                        window.api.settings.setValue(section, setting.key, control.value);
+                    };
+                    control.addEventListener('change', save);
+
+                    const recordBtn = document.createElement('button');
+                    recordBtn.type = 'button';
+                    recordBtn.className = 'raised';
+                    recordBtn.textContent = 'Record';
+                    let onKey = null;
+                    const stopCapture = () => {
+                        recordBtn.textContent = 'Record';
+                        if (onKey) {
+                            window.removeEventListener('keydown', onKey, true);
+                            onKey = null;
+                        }
+                    };
+                    recordBtn.addEventListener('click', () => {
+                        if (onKey) { stopCapture(); return; }
+                        recordBtn.textContent = 'Press keys\u2026 (Esc to cancel)';
+                        onKey = (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const k = e.key;
+                            if (k === 'Escape') { stopCapture(); return; }
+                            if (k === 'Shift' || k === 'Control' || k === 'Alt' || k === 'Meta') return;
+                            const parts = [];
+                            if (e.metaKey) parts.push('Cmd');
+                            if (e.ctrlKey) parts.push('Ctrl');
+                            if (e.altKey) parts.push('Alt');
+                            if (e.shiftKey) parts.push('Shift');
+                            parts.push(keybindToken(k));
+                            control.value = parts.join('+');
+                            stopCapture();
+                            save();
+                        };
+                        window.addEventListener('keydown', onKey, true);
+                    });
+
+                    row.appendChild(control);
+                    row.appendChild(recordBtn);
+                    container.appendChild(row);
                     if (setting.help) {
                         const helpText = document.createElement('div');
                         helpText.className = 'fieldDescription';

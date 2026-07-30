@@ -86,7 +86,8 @@
             { key: 'playback', order: 0 },
             { key: 'audio', order: 1 },
             { key: 'transcode', order: 2 },
-            { key: 'advanced', order: 3 }
+            { key: 'shortcuts', order: 3 },
+            { key: 'advanced', order: 4 }
         ],
         settings: {
             main: { enableMPV: true, fullscreen: false, userWebClient: '__SERVER_URL__' },
@@ -100,6 +101,10 @@
             },
             transcode: {
                 forceTranscoding: !!_savedSettings.forceTranscoding
+            },
+            shortcuts: {
+                historyBack: _savedSettings.keyHistoryBack || 'Cmd+[',
+                historyForward: _savedSettings.keyHistoryForward || 'Cmd+]'
             },
             advanced: {
                 transparentTitlebar: _savedSettings.transparentTitlebar !== false,
@@ -125,6 +130,10 @@
             ],
             transcode: [
                 { key: 'forceTranscoding', displayName: 'Force Transcoding', help: 'Always request a transcoded stream from the server, even when direct play would work.' }
+            ],
+            shortcuts: [
+                { key: 'historyBack', displayName: 'Go Back', help: 'Keyboard shortcut to navigate back to the previous page. Click and press the desired key combination.', inputType: 'keybind' },
+                { key: 'historyForward', displayName: 'Go Forward', help: 'Keyboard shortcut to navigate forward. Click and press the desired key combination.', inputType: 'keybind' }
             ],
             advanced: [
                 { key: 'hideScrollbar', displayName: 'Hide Scrollbar', help: 'Hide scrollbars throughout the app. Scrolling with the wheel, trackpad, and keyboard still works. Requires restart.' },

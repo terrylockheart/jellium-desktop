@@ -59,6 +59,8 @@ struct SettingsData {
     force_transcoding: bool,
     window_decorations: Option<WindowDecorations>,
     hide_scrollbar: bool,
+    key_history_back: String,
+    key_history_forward: String,
 }
 
 impl Default for SettingsData {
@@ -77,6 +79,8 @@ impl Default for SettingsData {
             force_transcoding: false,
             window_decorations: None,
             hide_scrollbar: true,
+            key_history_back: "Cmd+[".into(),
+            key_history_forward: "Cmd+]".into(),
         }
     }
 }
@@ -154,6 +158,12 @@ impl SettingsData {
         if let Some(b) = v.get("hideScrollbar").and_then(Value::as_bool) {
             self.hide_scrollbar = b;
         }
+        if let Some(s) = v.get("keyHistoryBack").and_then(Value::as_str) {
+            self.key_history_back = s.into();
+        }
+        if let Some(s) = v.get("keyHistoryForward").and_then(Value::as_str) {
+            self.key_history_forward = s.into();
+        }
     }
 
     fn to_json(&self) -> Value {
@@ -223,6 +233,18 @@ impl SettingsData {
         if !self.device_name.is_empty() {
             o.insert("deviceName".into(), Value::String(self.device_name.clone()));
         }
+        if self.key_history_back != "Cmd+[" {
+            o.insert(
+                "keyHistoryBack".into(),
+                Value::String(self.key_history_back.clone()),
+            );
+        }
+        if self.key_history_forward != "Cmd+]" {
+            o.insert(
+                "keyHistoryForward".into(),
+                Value::String(self.key_history_forward.clone()),
+            );
+        }
         Value::Object(o)
     }
 
@@ -268,6 +290,14 @@ impl SettingsData {
         o.insert(
             "deviceNameDefault".into(),
             Value::String(default_device_name()),
+        );
+        o.insert(
+            "keyHistoryBack".into(),
+            Value::String(self.key_history_back.clone()),
+        );
+        o.insert(
+            "keyHistoryForward".into(),
+            Value::String(self.key_history_forward.clone()),
         );
         let opts: Vec<Value> = hwdec_opts
             .iter()
@@ -477,6 +507,12 @@ string_accessors!(hwdec, set_hwdec, hwdec);
 string_accessors!(audio_passthrough, set_audio_passthrough, audio_passthrough);
 string_accessors!(audio_channels, set_audio_channels, audio_channels);
 string_accessors!(log_level, set_log_level, log_level);
+string_accessors!(key_history_back, set_key_history_back, key_history_back);
+string_accessors!(
+    key_history_forward,
+    set_key_history_forward,
+    key_history_forward
+);
 
 pub fn device_name() -> String {
     state().lock().data.device_name.clone()

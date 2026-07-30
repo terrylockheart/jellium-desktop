@@ -2337,6 +2337,7 @@ dependencies = [
  "cef",
  "jfn-cef",
  "jfn-compositor-core",
+ "jfn-config",
  "jfn-input",
  "jfn-logging",
  "jfn-macos-sink",

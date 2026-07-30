@@ -198,6 +198,108 @@ fn ns_keycode_to_vkey(kc: u16) -> i32 {
     }
 }
 
+/// Modifier bits a configurable keybinding can require/forbid.
+const KEYBIND_MOD_MASK: u32 =
+    EVENTFLAG_COMMAND_DOWN | EVENTFLAG_CONTROL_DOWN | EVENTFLAG_ALT_DOWN | EVENTFLAG_SHIFT_DOWN;
+
+/// Map a chord key token (e.g. "[", "A", "Left", "F5") to a Windows VK code,
+/// matching the values produced by `ns_keycode_to_vkey`.
+fn keyname_to_vkey(token: &str) -> Option<i32> {
+    if token.chars().count() == 1 {
+        let c = token.chars().next().unwrap().to_ascii_uppercase();
+        return match c {
+            'A'..='Z' | '0'..='9' => Some(c as i32),
+            ';' => Some(0xBA),
+            '=' => Some(0xBB),
+            ',' => Some(0xBC),
+            '-' => Some(0xBD),
+            '.' => Some(0xBE),
+            '/' => Some(0xBF),
+            '`' => Some(0xC0),
+            '[' => Some(0xDB),
+            '\\' => Some(0xDC),
+            ']' => Some(0xDD),
+            '\'' => Some(0xDE),
+            _ => None,
+        };
+    }
+    let lower = token.to_ascii_lowercase();
+    let vk = match lower.as_str() {
+        "left" => 0x25,
+        "up" => 0x26,
+        "right" => 0x27,
+        "down" => 0x28,
+        "space" => 0x20,
+        "enter" | "return" => 0x0D,
+        "tab" => 0x09,
+        "esc" | "escape" => 0x1B,
+        "backspace" => 0x08,
+        "delete" | "del" => 0x2E,
+        "home" => 0x24,
+        "end" => 0x23,
+        "pageup" | "pgup" => 0x21,
+        "pagedown" | "pgdn" => 0x22,
+        "f1" => 0x70,
+        "f2" => 0x71,
+        "f3" => 0x72,
+        "f4" => 0x73,
+        "f5" => 0x74,
+        "f6" => 0x75,
+        "f7" => 0x76,
+        "f8" => 0x77,
+        "f9" => 0x78,
+        "f10" => 0x79,
+        "f11" => 0x7A,
+        "f12" => 0x7B,
+        _ => return None,
+    };
+    Some(vk)
+}
+
+/// Parse a chord string such as "Cmd+[" or "Ctrl+Shift+Left" into a
+/// (windows_vkey, required-modifier-mask) pair. Returns None if unparseable.
+fn parse_chord(chord: &str) -> Option<(i32, u32)> {
+    let mut mods = 0u32;
+    let mut vkey: Option<i32> = None;
+    for raw in chord.split('+') {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.to_ascii_lowercase().as_str() {
+            "cmd" | "command" | "meta" | "win" | "super" => mods |= EVENTFLAG_COMMAND_DOWN,
+            "ctrl" | "control" => mods |= EVENTFLAG_CONTROL_DOWN,
+            "alt" | "option" | "opt" => mods |= EVENTFLAG_ALT_DOWN,
+            "shift" => mods |= EVENTFLAG_SHIFT_DOWN,
+            _ => {
+                vkey = keyname_to_vkey(token);
+                vkey?;
+            }
+        }
+    }
+    vkey.map(|vk| (vk, mods))
+}
+
+/// Returns the history-navigation direction (0 = back, 1 = forward) configured
+/// for the given key event, or None. Bindings come from the settings store so
+/// they can be edited in Client Settings.
+fn match_history_keybind(vkey: i32, mods: u32) -> Option<i32> {
+    let active = mods & KEYBIND_MOD_MASK;
+    if let Some((vk, m)) = parse_chord(&jfn_config::key_history_back())
+        && vkey == vk
+        && active == m
+    {
+        return Some(0);
+    }
+    if let Some((vk, m)) = parse_chord(&jfn_config::key_history_forward())
+        && vkey == vk
+        && active == m
+    {
+        return Some(1);
+    }
+    None
+}
+
 // =====================================================================
 // Cursor state
 // =====================================================================
@@ -465,6 +567,17 @@ define_class!(
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &AnyObject) {
             let (vkey, mods, kc, ch, ch_nomod) = key_event_fields(event);
+
+            // Configurable history navigation shortcuts (defaults: Cmd+[ back,
+            // Cmd+] forward). Only checked when a modifier is held, so normal
+            // typing isn't slowed. Consumed so they don't reach the web layer.
+            if mods & KEYBIND_MOD_MASK != 0 {
+                if let Some(action) = match_history_keybind(vkey, mods) {
+                    jfn_input_dispatch_history_nav(action);
+                    return;
+                }
+            }
+
             jfn_input_dispatch_key_full(1, vkey, kc as i32, mods, ch, ch_nomod, 0);
             // Forward typed characters for text input — paired CHAR event only
             // for printable chars + Return.
@@ -658,4 +771,44 @@ pub fn jfn_input_macos_create_view() -> *mut c_void {
     let view: Retained<InputView> = unsafe { msg_send![super(view), initWithFrame: zero_rect] };
     // Retain across the FFI boundary; caller owns the +1.
     Retained::into_raw(view) as *mut c_void
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_default_bracket_chords() {
+        assert_eq!(parse_chord("Cmd+["), Some((0xDB, EVENTFLAG_COMMAND_DOWN)));
+        assert_eq!(parse_chord("Cmd+]"), Some((0xDD, EVENTFLAG_COMMAND_DOWN)));
+    }
+
+    #[test]
+    fn parses_multi_modifier_and_named_keys() {
+        assert_eq!(
+            parse_chord("Ctrl+Shift+Left"),
+            Some((0x25, EVENTFLAG_CONTROL_DOWN | EVENTFLAG_SHIFT_DOWN))
+        );
+        assert_eq!(parse_chord("Alt+F5"), Some((0x74, EVENTFLAG_ALT_DOWN)));
+        assert_eq!(parse_chord("A"), Some((0x41, 0)));
+    }
+
+    #[test]
+    fn rejects_unknown_keys() {
+        assert_eq!(parse_chord("Cmd+Frobnicate"), None);
+        assert_eq!(parse_chord("Cmd+"), None);
+    }
+
+    #[test]
+    fn exact_modifier_match_required() {
+        // Cmd+[ should match only when exactly Command is down.
+        assert_eq!(match_history_keybind(0xDB, EVENTFLAG_COMMAND_DOWN), Some(0));
+        // Cmd+Shift+[ must NOT trigger back (extra Shift).
+        assert_eq!(
+            match_history_keybind(0xDB, EVENTFLAG_COMMAND_DOWN | EVENTFLAG_SHIFT_DOWN),
+            None
+        );
+        // Cmd+] = forward.
+        assert_eq!(match_history_keybind(0xDD, EVENTFLAG_COMMAND_DOWN), Some(1));
+    }
 }

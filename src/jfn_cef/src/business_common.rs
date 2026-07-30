@@ -72,6 +72,8 @@ pub(crate) fn apply_setting_value(_section: &str, key: &str, value: Option<&str>
         "hideScrollbar" => jfn_config::set_hide_scrollbar(value == "true"),
         "logLevel" => jfn_config::set_log_level(value),
         "forceTranscoding" => jfn_config::set_force_transcoding(value == "true"),
+        "historyBack" => jfn_config::set_key_history_back(value),
+        "historyForward" => jfn_config::set_key_history_forward(value),
         // Pass empty platform_default — Rust setter clears when raw equals
         // the empty string. Neither caller has the live hostname handy here.
         "deviceName" => jfn_config::set_device_name(value, ""),
