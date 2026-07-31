@@ -32,7 +32,7 @@
 
     const state = {
         actors: [],
-        movies: [],
+        snapshot: null,
         rolesData: {},
         role: 'Actor',
         search: '',
@@ -293,9 +293,133 @@
         return out;
     }
 
+    function personKey(person) {
+        return person.Id || ('name:' + (person.Name || ''));
+    }
+
+    // Item ids arrive dashed from websocket payloads but dashless from /Items.
+    function normalizeId(value) {
+        if (typeof value !== 'string') {
+            return '';
+        }
+        return value.replace(/-/g, '').toLowerCase();
+    }
+
+    // ---- movie snapshot ----
+    //
+    // A compact per-movie index kept alongside the aggregate. It records only
+    // what aggregation needs (year, play count, creation date, cast keys) plus a
+    // shared person table, so a deleted movie's contribution can be subtracted
+    // locally instead of rescanning the library. Person names/images are stored
+    // once rather than per movie to keep the payload small.
+    function buildSnapshot(movies) {
+        const people = {};
+        const items = {};
+
+        for (const movie of movies) {
+            const cast = [];
+            const seen = new Set();
+            for (const person of (movie.People || [])) {
+                const type = person.Type;
+                if (!type) {
+                    continue;
+                }
+                const key = personKey(person);
+                const dedupe = type + '\u0000' + key;
+                if (seen.has(dedupe)) {
+                    continue;
+                }
+                seen.add(dedupe);
+                cast.push([type, key]);
+
+                const known = people[key];
+                if (!known) {
+                    people[key] = [person.Id || null, person.Name || '', person.PrimaryImageTag || null];
+                } else {
+                    if (!known[0] && person.Id) {
+                        known[0] = person.Id;
+                    }
+                    if (!known[2] && person.PrimaryImageTag) {
+                        known[2] = person.PrimaryImageTag;
+                    }
+                }
+            }
+            items[normalizeId(movie.Id)] = [movieYear(movie), moviePlayCount(movie), movie.DateCreated || '', cast];
+        }
+
+        return { people, items };
+    }
+
+    function isSnapshot(value) {
+        return !!(value && value.items && value.people);
+    }
+
+    // Rebuilds the same structure aggregateAllRoles() produces, from the index.
+    function aggregateFromSnapshot(snapshot) {
+        const roles = {};
+
+        for (const id of Object.keys(snapshot.items)) {
+            const entry = snapshot.items[id];
+            const year = entry[0];
+            const plays = entry[1];
+            for (const pair of (entry[3] || [])) {
+                const type = pair[0];
+                const key = pair[1];
+                const bucket = roles[type] || (roles[type] = {});
+                let actor = bucket[key];
+                if (!actor) {
+                    const meta = snapshot.people[key] || [null, '', null];
+                    actor = bucket[key] = {
+                        Id: meta[0],
+                        Name: meta[1],
+                        PrimaryImageTag: meta[2],
+                        firstYear: null,
+                        movieCount: 0,
+                        watchCount: 0
+                    };
+                }
+                actor.movieCount += 1;
+                actor.watchCount += plays;
+                if (Number.isFinite(year)) {
+                    actor.firstYear = actor.firstYear == null ? year : Math.min(actor.firstYear, year);
+                }
+            }
+        }
+
+        const out = {};
+        for (const type of Object.keys(roles)) {
+            out[type] = Object.keys(roles[type]).map((key) => roles[type][key]);
+        }
+        return out;
+    }
+
+    function fingerprintFromSnapshot(snapshot) {
+        let maxDate = '';
+        let count = 0;
+        for (const id of Object.keys(snapshot.items)) {
+            count += 1;
+            const created = snapshot.items[id][2];
+            if (created && created > maxDate) {
+                maxDate = created;
+            }
+        }
+        return { count, maxDate };
+    }
+
+    // Drops deleted movies from the index. Returns how many were actually held.
+    function removeFromSnapshot(snapshot, ids) {
+        let removed = 0;
+        for (const id of ids) {
+            if (id && snapshot.items[id]) {
+                delete snapshot.items[id];
+                removed += 1;
+            }
+        }
+        return removed;
+    }
+
     // Ordered list of roles that currently have entries in state.rolesData.
-    function getRoles() {
-        const data = state.rolesData || {};
+    function getRoles() {        const data = state.rolesData || {};
         const present = Object.keys(data).filter((r) => (data[r] || []).length > 0);
         const ordered = ROLE_ORDER.filter((t) => present.indexOf(t) !== -1);
         const extras = present.filter((t) => ROLE_ORDER.indexOf(t) === -1).sort();
@@ -321,9 +445,15 @@
         return null;
     }
 
-    function saveCache(parentId, roles, fingerprint) {
+    function saveCache(parentId, roles, fingerprint, snapshot) {
+        const key = cacheKey(parentId);
+        const savedAt = Date.now();
         try {
-            window.localStorage.setItem(cacheKey(parentId), JSON.stringify({ roles, fingerprint, savedAt: Date.now() }));
+            window.localStorage.setItem(key, JSON.stringify({ roles, fingerprint, snapshot, savedAt }));
+            return;
+        } catch (e) { /* quota — retry without the (larger) snapshot below */ }
+        try {
+            window.localStorage.setItem(key, JSON.stringify({ roles, fingerprint, savedAt }));
         } catch (e) { /* quota / unavailable — non-fatal */ }
     }
 
@@ -977,7 +1107,7 @@
                 if (cached) {
                     state.rolesData = cached.roles;
                     state.fingerprint = cached.fingerprint;
-                    state.movies = [];
+                    state.snapshot = isSnapshot(cached.snapshot) ? cached.snapshot : null;
                     if (page) {
                         applyLoadedData(page);
                     } else {
@@ -1001,11 +1131,11 @@
             if (state.parentId !== parentId) {
                 return;
             }
-            state.movies = movies;
+            state.snapshot = buildSnapshot(movies);
             state.rolesData = aggregateAllRoles(movies);
             state.fingerprint = fingerprintFromMovies(movies);
             state.needsCheck = false;
-            saveCache(parentId, state.rolesData, state.fingerprint);
+            saveCache(parentId, state.rolesData, state.fingerprint, state.snapshot);
             markDataLoaded();
 
             const p = document.getElementById(PAGE_ID);
@@ -1099,9 +1229,36 @@
         }
     }
 
-    // Library-change notifications mark the data for verification. The cheap
-    // fingerprint probe decides whether a rescan is actually needed, so routine
-    // server chatter (playback activity, metadata refreshes) costs nothing.
+    function changedIds(value) {
+        if (!Array.isArray(value)) {
+            return [];
+        }
+        return value
+            .map((entry) => normalizeId(typeof entry === 'string' ? entry : (entry && (entry.Id || entry.ItemId))))
+            .filter(Boolean);
+    }
+
+    // Subtracts deleted movies from the cached index and rebuilds the aggregate
+    // locally. Returns true when something was actually removed.
+    function applyRemovals(ids, page) {
+        if (!isSnapshot(state.snapshot) || !removeFromSnapshot(state.snapshot, ids)) {
+            return false;
+        }
+        state.rolesData = aggregateFromSnapshot(state.snapshot);
+        state.fingerprint = fingerprintFromSnapshot(state.snapshot);
+        saveCache(state.parentId, state.rolesData, state.fingerprint, state.snapshot);
+        if (page) {
+            applyLoadedData(page);
+        } else {
+            markDataLoaded();
+        }
+        return true;
+    }
+
+    // Library-change notifications mark the data for verification. Deletions are
+    // resolved from the cached index without touching the network; anything else
+    // falls through to the cheap fingerprint probe, which decides whether a full
+    // rescan is warranted. Routine chatter (playback activity) costs nothing.
     function onApiMessage(e, msg) {
         const data = msg || e;
         if (!data || data.MessageType !== 'LibraryChanged') {
@@ -1109,12 +1266,27 @@
         }
         state.needsCheck = true;
 
-        const parentId = getLibraryParentId();
-        if (!state.loaded || !parentId || state.parentId !== parentId || state.loading) {
+        // Keyed to the library the data belongs to, not the current route: a
+        // movie is usually deleted from its details page, which has no library
+        // id in the URL.
+        const parentId = state.parentId;
+        if (!state.loaded || !parentId || state.loading) {
             return;
         }
+
         const page = document.getElementById(PAGE_ID);
-        verifyLoadedData(page && isActorsShown() ? page : null, parentId, state.fingerprint);
+        const target = page && isActorsShown() ? page : null;
+        const payload = data.Data || {};
+        const removed = changedIds(payload.ItemsRemoved);
+        const otherChanges = changedIds(payload.ItemsAdded).length
+            + changedIds(payload.ItemsUpdated).length;
+
+        if (removed.length && !otherChanges) {
+            applyRemovals(removed, target);
+        }
+        // Always confirm against the server. If the local result disagrees with
+        // the real library state, this falls back to a full rescan.
+        verifyLoadedData(target, parentId, state.fingerprint);
     }
 
     function setupLibraryWatch() {
@@ -1216,6 +1388,6 @@
 
     // Exposed for headless unit testing of pure logic (no-op in the app).
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports = { aggregateActors, aggregatePeople, aggregateAllRoles, getRolesFromMovies, roleLabel, getVisibleActors, sortActors, hasPhoto, movieYear, moviePlayCount, fingerprintFromMovies, sameFingerprint, state };
+        module.exports = { aggregateActors, aggregatePeople, aggregateAllRoles, getRolesFromMovies, roleLabel, getVisibleActors, sortActors, hasPhoto, movieYear, moviePlayCount, fingerprintFromMovies, sameFingerprint, buildSnapshot, aggregateFromSnapshot, fingerprintFromSnapshot, removeFromSnapshot, normalizeId, state };
     }
 })();
