@@ -44,6 +44,7 @@
         dismissed: false,
         libWatch: false,
         cacheCheckToken: null,
+        loading: false,
         parentId: null,
         collapsed: { withPhoto: false, withoutPhoto: false }
     };
@@ -366,6 +367,9 @@
     }
 
     function isCurrentActorsPage(page, parentId) {
+        if (!page) {
+            return state.parentId === parentId;
+        }
         return document.getElementById(PAGE_ID) === page
             && getLibraryParentId() === parentId
             && isActorsShown();
@@ -374,7 +378,9 @@
     function verifyCachedData(page, parentId, cached) {
         const token = {};
         state.cacheCheckToken = token;
-        setStatus(page, 'Checking for changes\u2026');
+        if (page) {
+            setStatus(page, 'Checking for changes\u2026');
+        }
 
         fetchFingerprint(parentId).then((fingerprint) => {
             if (state.cacheCheckToken !== token || !isCurrentActorsPage(page, parentId)) {
@@ -382,11 +388,15 @@
             }
             state.cacheCheckToken = null;
             if (!fingerprint) {
-                setStatus(page, 'Cached results (library check unavailable).');
+                if (page) {
+                    setStatus(page, 'Cached results (library check unavailable).');
+                }
                 return;
             }
             if (sameFingerprint(fingerprint, cached.fingerprint)) {
-                setStatus(page, '');
+                if (page) {
+                    setStatus(page, '');
+                }
                 return;
             }
             state.stale = true;
@@ -397,7 +407,9 @@
             }
             state.cacheCheckToken = null;
             console.debug('[actors-mvp] cache verification failed', err);
-            setStatus(page, 'Cached results (library check unavailable).');
+            if (page) {
+                setStatus(page, 'Cached results (library check unavailable).');
+            }
         });
     }
 
@@ -913,61 +925,89 @@
         setStatus(page, state.actors.length ? '' : ('No ' + roleLabel(state.role).toLowerCase() + ' found in this library.'));
     }
 
+    function markDataLoaded() {
+        selectRoleData();
+        state.loaded = true;
+        state.stale = false;
+    }
+
     async function loadActors(page, force) {
         const parentId = getLibraryParentId();
+
+        if (!parentId || !currentUserId()) {
+            return;
+        }
 
         if (force) {
             state.cacheCheckToken = null;
         }
 
+        if (state.loading && state.parentId === parentId) {
+            if (page) {
+                setStatus(page, 'Loading movies\u2026');
+            }
+            return;
+        }
+
         // In-session cache: already loaded this library and nothing changed.
         if (state.loaded && state.parentId === parentId && !state.stale && !force) {
-            applyLoadedData(page);
+            if (page) {
+                applyLoadedData(page);
+            }
             return;
         }
 
         state.parentId = parentId;
+        state.loading = true;
 
-        // Persistent cache (survives restarts): use it if a cheap fingerprint
-        // check shows the library hasn't changed.
-        if (!force && !state.stale) {
-            const cached = loadCache(parentId);
-            if (cached) {
-                state.rolesData = cached.roles;
-                state.movies = [];
-                applyLoadedData(page);
-                verifyCachedData(page, parentId, cached);
-                return;
-            }
-        }
-
-        // Full scan.
-        setStatus(page, state.loaded ? 'Refreshing\u2026' : 'Loading movies\u2026');
         try {
+            // Persistent cache (survives restarts): use it if a cheap fingerprint
+            // check shows the library hasn't changed.
+            if (!force && !state.stale) {
+                const cached = loadCache(parentId);
+                if (cached) {
+                    state.rolesData = cached.roles;
+                    state.movies = [];
+                    if (page) {
+                        applyLoadedData(page);
+                    } else {
+                        markDataLoaded();
+                    }
+                    verifyCachedData(page, parentId, cached);
+                    return;
+                }
+            }
+
+            // Full scan.
+            if (page) {
+                setStatus(page, state.loaded ? 'Refreshing\u2026' : 'Loading movies\u2026');
+            }
             const movies = await fetchMoviesWithPeople(parentId, (loaded, total) => {
                 const p = document.getElementById(PAGE_ID);
                 if (p) {
                     setStatus(p, 'Scanning movies\u2026 ' + loaded + '/' + total);
                 }
             });
-            if (getLibraryParentId() !== parentId || !isActorsShown()) {
+            if (state.parentId !== parentId) {
                 return;
             }
             state.movies = movies;
             state.rolesData = aggregateAllRoles(movies);
             saveCache(parentId, state.rolesData, fingerprintFromMovies(movies));
+            markDataLoaded();
 
             const p = document.getElementById(PAGE_ID);
-            if (!p) {
-                return;
+            if (p && isCurrentActorsPage(p, parentId)) {
+                applyLoadedData(p);
             }
-            applyLoadedData(p);
         } catch (err) {
             console.error('[actors-mvp] failed loading actors', err);
             const p = document.getElementById(PAGE_ID);
             if (p) {
                 setStatus(p, 'Failed to load actors.');
             }
+        } finally {
+            state.loading = false;
         }
     }
 
@@ -983,6 +1023,11 @@
             } else {
                 positionPage(page);
             }
+        } else if (isMoviesRoute() && getLibraryParentId() && currentUserId()) {
+            // Warm the active movie library before the user opens Actors.
+            const parentId = getLibraryParentId();
+            const force = state.stale && state.parentId === parentId;
+            void loadActors(null, force);
         } else if (page) {
             closeActorsPage();
         }
