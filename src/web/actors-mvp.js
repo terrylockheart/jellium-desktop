@@ -40,7 +40,8 @@
         sortBy: 'name',
         sortOrder: 'asc',
         loaded: false,
-        stale: false,
+        needsCheck: false,
+        fingerprint: null,
         dismissed: false,
         libWatch: false,
         cacheCheckToken: null,
@@ -375,7 +376,10 @@
             && isActorsShown();
     }
 
-    function verifyCachedData(page, parentId, cached) {
+    // Cheap library-state probe against the fingerprint of the data we already
+    // hold. A full rescan only happens when the library actually changed, so
+    // playback activity and other notifications never cost a rescan.
+    function verifyLoadedData(page, parentId, knownFingerprint) {
         const token = {};
         state.cacheCheckToken = token;
         if (page) {
@@ -388,24 +392,26 @@
             }
             state.cacheCheckToken = null;
             if (!fingerprint) {
+                state.needsCheck = false;
                 if (page) {
                     setStatus(page, 'Cached results (library check unavailable).');
                 }
                 return;
             }
-            if (sameFingerprint(fingerprint, cached.fingerprint)) {
+            if (sameFingerprint(fingerprint, knownFingerprint)) {
+                state.needsCheck = false;
                 if (page) {
                     setStatus(page, '');
                 }
                 return;
             }
-            state.stale = true;
             void loadActors(page, true);
         }).catch((err) => {
             if (state.cacheCheckToken !== token || !isCurrentActorsPage(page, parentId)) {
                 return;
             }
             state.cacheCheckToken = null;
+            state.needsCheck = false;
             console.debug('[actors-mvp] cache verification failed', err);
             if (page) {
                 setStatus(page, 'Cached results (library check unavailable).');
@@ -913,7 +919,6 @@
     function applyLoadedData(page) {
         selectRoleData();
         state.loaded = true;
-        state.stale = false;
         if (page._jamYearDd) {
             page._jamYearDd.refresh();
         }
@@ -928,7 +933,6 @@
     function markDataLoaded() {
         selectRoleData();
         state.loaded = true;
-        state.stale = false;
     }
 
     async function loadActors(page, force) {
@@ -940,6 +944,7 @@
 
         if (force) {
             state.cacheCheckToken = null;
+            state.needsCheck = false;
         }
 
         if (state.loading && state.parentId === parentId) {
@@ -949,10 +954,14 @@
             return;
         }
 
-        // In-session cache: already loaded this library and nothing changed.
-        if (state.loaded && state.parentId === parentId && !state.stale && !force) {
+        // Data already in memory: show it right away. A pending library-change
+        // notification only costs a cheap fingerprint probe, never a rescan.
+        if (state.loaded && state.parentId === parentId && !force) {
             if (page) {
                 applyLoadedData(page);
+            }
+            if (state.needsCheck) {
+                verifyLoadedData(page, parentId, state.fingerprint);
             }
             return;
         }
@@ -963,17 +972,18 @@
         try {
             // Persistent cache (survives restarts): use it if a cheap fingerprint
             // check shows the library hasn't changed.
-            if (!force && !state.stale) {
+            if (!force) {
                 const cached = loadCache(parentId);
                 if (cached) {
                     state.rolesData = cached.roles;
+                    state.fingerprint = cached.fingerprint;
                     state.movies = [];
                     if (page) {
                         applyLoadedData(page);
                     } else {
                         markDataLoaded();
                     }
-                    verifyCachedData(page, parentId, cached);
+                    verifyLoadedData(page, parentId, cached.fingerprint);
                     return;
                 }
             }
@@ -993,7 +1003,9 @@
             }
             state.movies = movies;
             state.rolesData = aggregateAllRoles(movies);
-            saveCache(parentId, state.rolesData, fingerprintFromMovies(movies));
+            state.fingerprint = fingerprintFromMovies(movies);
+            state.needsCheck = false;
+            saveCache(parentId, state.rolesData, state.fingerprint);
             markDataLoaded();
 
             const p = document.getElementById(PAGE_ID);
@@ -1025,9 +1037,7 @@
             }
         } else if (isMoviesRoute() && getLibraryParentId() && currentUserId()) {
             // Warm the active movie library before the user opens Actors.
-            const parentId = getLibraryParentId();
-            const force = state.stale && state.parentId === parentId;
-            void loadActors(null, force);
+            void loadActors(null);
         } else if (page) {
             closeActorsPage();
         }
@@ -1089,17 +1099,22 @@
         }
     }
 
-    // Invalidate the actor cache when the server reports library changes; if the
-    // page is open, rescan immediately.
+    // Library-change notifications mark the data for verification. The cheap
+    // fingerprint probe decides whether a rescan is actually needed, so routine
+    // server chatter (playback activity, metadata refreshes) costs nothing.
     function onApiMessage(e, msg) {
         const data = msg || e;
-        if (data && data.MessageType === 'LibraryChanged') {
-            state.stale = true;
-            const page = document.getElementById(PAGE_ID);
-            if (page && isActorsShown()) {
-                loadActors(page, true);
-            }
+        if (!data || data.MessageType !== 'LibraryChanged') {
+            return;
         }
+        state.needsCheck = true;
+
+        const parentId = getLibraryParentId();
+        if (!state.loaded || !parentId || state.parentId !== parentId || state.loading) {
+            return;
+        }
+        const page = document.getElementById(PAGE_ID);
+        verifyLoadedData(page && isActorsShown() ? page : null, parentId, state.fingerprint);
     }
 
     function setupLibraryWatch() {
