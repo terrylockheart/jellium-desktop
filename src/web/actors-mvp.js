@@ -43,6 +43,7 @@
         stale: false,
         dismissed: false,
         libWatch: false,
+        cacheCheckToken: null,
         parentId: null,
         collapsed: { withPhoto: false, withoutPhoto: false }
     };
@@ -362,6 +363,42 @@
             count: (r && Number.isFinite(r.TotalRecordCount)) ? r.TotalRecordCount : items.length,
             maxDate: (items[0] && items[0].DateCreated) || ''
         };
+    }
+
+    function isCurrentActorsPage(page, parentId) {
+        return document.getElementById(PAGE_ID) === page
+            && getLibraryParentId() === parentId
+            && isActorsShown();
+    }
+
+    function verifyCachedData(page, parentId, cached) {
+        const token = {};
+        state.cacheCheckToken = token;
+        setStatus(page, 'Checking for changes\u2026');
+
+        fetchFingerprint(parentId).then((fingerprint) => {
+            if (state.cacheCheckToken !== token || !isCurrentActorsPage(page, parentId)) {
+                return;
+            }
+            state.cacheCheckToken = null;
+            if (!fingerprint) {
+                setStatus(page, 'Cached results (library check unavailable).');
+                return;
+            }
+            if (sameFingerprint(fingerprint, cached.fingerprint)) {
+                setStatus(page, '');
+                return;
+            }
+            state.stale = true;
+            void loadActors(page, true);
+        }).catch((err) => {
+            if (state.cacheCheckToken !== token || !isCurrentActorsPage(page, parentId)) {
+                return;
+            }
+            state.cacheCheckToken = null;
+            console.debug('[actors-mvp] cache verification failed', err);
+            setStatus(page, 'Cached results (library check unavailable).');
+        });
     }
 
     function getVisibleActors() {
@@ -879,6 +916,10 @@
     async function loadActors(page, force) {
         const parentId = getLibraryParentId();
 
+        if (force) {
+            state.cacheCheckToken = null;
+        }
+
         // In-session cache: already loaded this library and nothing changed.
         if (state.loaded && state.parentId === parentId && !state.stale && !force) {
             applyLoadedData(page);
@@ -892,17 +933,11 @@
         if (!force && !state.stale) {
             const cached = loadCache(parentId);
             if (cached) {
-                setStatus(page, 'Checking for changes\u2026');
-                const fp = await fetchFingerprint(parentId).catch(() => null);
-                if (document.getElementById(PAGE_ID) !== page || !isActorsShown()) {
-                    return;
-                }
-                if (fp && sameFingerprint(fp, cached.fingerprint)) {
-                    state.rolesData = cached.roles;
-                    state.movies = [];
-                    applyLoadedData(page);
-                    return;
-                }
+                state.rolesData = cached.roles;
+                state.movies = [];
+                applyLoadedData(page);
+                verifyCachedData(page, parentId, cached);
+                return;
             }
         }
 
