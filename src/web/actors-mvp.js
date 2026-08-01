@@ -132,12 +132,8 @@
         }
 
         const pageSize = 200;
-        let startIndex = 0;
-        let total = Number.POSITIVE_INFINITY;
-        const movies = [];
-
-        while (startIndex < total) {
-            const result = await a.getItems(uid, {
+        const parallelPages = 8;
+        const fetchPage = (startIndex) => a.getItems(uid, {
                 ParentId: parentId || undefined,
                 IncludeItemTypes: 'Movie',
                 Recursive: true,
@@ -149,20 +145,43 @@
                 StartIndex: startIndex
             });
 
-            const items = (result && result.Items) || [];
-            total = (result && Number.isFinite(result.TotalRecordCount)) ? result.TotalRecordCount : items.length;
-            movies.push(...items);
-            startIndex += items.length;
-
+        const first = await fetchPage(0);
+        const firstItems = (first && first.Items) || [];
+        const total = (first && Number.isFinite(first.TotalRecordCount))
+            ? first.TotalRecordCount
+            : firstItems.length;
+        if (!firstItems.length || total <= firstItems.length) {
             if (onProgress) {
-                onProgress(Math.min(movies.length, total), total);
+                onProgress(firstItems.length, total);
             }
-            if (!items.length) {
-                break;
+            return firstItems;
+        }
+
+        const pages = Math.ceil(total / pageSize);
+        const results = new Array(pages);
+        results[0] = firstItems;
+        let loaded = firstItems.length;
+        let nextPage = 1;
+
+        async function worker() {
+            while (nextPage < pages) {
+                const page = nextPage;
+                nextPage += 1;
+                const result = await fetchPage(page * pageSize);
+                const items = (result && result.Items) || [];
+                results[page] = items;
+                loaded += items.length;
+                if (onProgress) {
+                    onProgress(Math.min(loaded, total), total);
+                }
             }
         }
 
-        return movies;
+        if (onProgress) {
+            onProgress(Math.min(loaded, total), total);
+        }
+        await Promise.all(Array.from({ length: Math.min(parallelPages, pages - 1) }, worker));
+        return results.flat();
     }
 
     function aggregatePeople(movies, roleType) {
@@ -1282,10 +1301,15 @@
             + changedIds(payload.ItemsUpdated).length;
 
         if (removed.length && !otherChanges) {
-            applyRemovals(removed, target);
+            if (applyRemovals(removed, target)) {
+                // The snapshot and its fingerprint now reflect the deletion
+                // exactly, so no server probe or full scan is needed.
+                state.needsCheck = false;
+                return;
+            }
         }
-        // Always confirm against the server. If the local result disagrees with
-        // the real library state, this falls back to a full rescan.
+        // Additions, updates, and deletions absent from an older index still
+        // need confirmation. A disagreement falls back to a full rescan.
         verifyLoadedData(target, parentId, state.fingerprint);
     }
 
@@ -1388,6 +1412,6 @@
 
     // Exposed for headless unit testing of pure logic (no-op in the app).
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports = { aggregateActors, aggregatePeople, aggregateAllRoles, getRolesFromMovies, roleLabel, getVisibleActors, sortActors, hasPhoto, movieYear, moviePlayCount, fingerprintFromMovies, sameFingerprint, buildSnapshot, aggregateFromSnapshot, fingerprintFromSnapshot, removeFromSnapshot, normalizeId, state };
+        module.exports = { fetchMoviesWithPeople, aggregateActors, aggregatePeople, aggregateAllRoles, getRolesFromMovies, roleLabel, getVisibleActors, sortActors, hasPhoto, movieYear, moviePlayCount, fingerprintFromMovies, sameFingerprint, buildSnapshot, aggregateFromSnapshot, fingerprintFromSnapshot, removeFromSnapshot, normalizeId, state };
     }
 })();
