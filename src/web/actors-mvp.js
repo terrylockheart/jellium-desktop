@@ -29,6 +29,9 @@
     const TAB_ACTIVE = 'jam-tab-active';
     const FILTER_MARK = 'data-jam-filter';
     const ROUTE_FLAG = 'jam=actors';
+    const CACHE_DB_NAME = 'jamActorsCache';
+    const CACHE_STORE_NAME = 'records';
+    const INITIAL_GROUP_CARD_COUNT = 100;
 
     const state = {
         actors: [],
@@ -47,7 +50,8 @@
         cacheCheckToken: null,
         loading: false,
         parentId: null,
-        collapsed: { withPhoto: false, withoutPhoto: false }
+        collapsed: { withPhoto: false, withoutPhoto: false },
+        visibleCards: { withPhoto: INITIAL_GROUP_CARD_COUNT, withoutPhoto: INITIAL_GROUP_CARD_COUNT }
     };
 
     const SORT_OPTIONS = [
@@ -124,7 +128,7 @@
         return ud && Number.isFinite(ud.PlayCount) ? ud.PlayCount : 0;
     }
 
-    async function fetchMoviesWithPeople(parentId, onProgress) {
+    async function fetchMoviesWithPeople(parentId, onProgress, onPage) {
         const a = api();
         const uid = currentUserId();
         if (!a || !uid) {
@@ -133,33 +137,48 @@
 
         const pageSize = 200;
         const parallelPages = 8;
-        const fetchPage = (startIndex) => a.getItems(uid, {
+        const fetchPage = (startIndex, includeTotal) => a.getItems(uid, {
                 ParentId: parentId || undefined,
                 IncludeItemTypes: 'Movie',
                 Recursive: true,
                 Fields: 'People,ProductionYear,PremiereDate,DateCreated',
                 EnableImages: false,
                 EnableUserData: true,
-                SortBy: 'SortName',
                 Limit: pageSize,
-                StartIndex: startIndex
+                StartIndex: startIndex,
+                EnableTotalRecordCount: includeTotal
             });
 
-        const first = await fetchPage(0);
+        let results = null;
+        function acceptPage(items, page) {
+            if (onPage) {
+                onPage(items, page);
+            } else {
+                results[page] = items;
+            }
+        }
+
+        const first = await fetchPage(0, true);
         const firstItems = (first && first.Items) || [];
         const total = (first && Number.isFinite(first.TotalRecordCount))
             ? first.TotalRecordCount
             : firstItems.length;
         if (!firstItems.length || total <= firstItems.length) {
+            results = onPage ? null : [];
+            if (onPage) {
+                onPage(firstItems, 0);
+            } else {
+                results.push(firstItems);
+            }
             if (onProgress) {
                 onProgress(firstItems.length, total);
             }
-            return firstItems;
+            return onPage ? undefined : firstItems;
         }
 
         const pages = Math.ceil(total / pageSize);
-        const results = new Array(pages);
-        results[0] = firstItems;
+        results = onPage ? null : new Array(pages);
+        acceptPage(firstItems, 0);
         let loaded = firstItems.length;
         let nextPage = 1;
 
@@ -167,9 +186,9 @@
             while (nextPage < pages) {
                 const page = nextPage;
                 nextPage += 1;
-                const result = await fetchPage(page * pageSize);
+                const result = await fetchPage(page * pageSize, false);
                 const items = (result && result.Items) || [];
-                results[page] = items;
+                acceptPage(items, page);
                 loaded += items.length;
                 if (onProgress) {
                     onProgress(Math.min(loaded, total), total);
@@ -181,7 +200,7 @@
             onProgress(Math.min(loaded, total), total);
         }
         await Promise.all(Array.from({ length: Math.min(parallelPages, pages - 1) }, worker));
-        return results.flat();
+        return onPage ? undefined : results.flat();
     }
 
     function aggregatePeople(movies, roleType) {
@@ -331,10 +350,13 @@
     // shared person table, so a deleted movie's contribution can be subtracted
     // locally instead of rescanning the library. Person names/images are stored
     // once rather than per movie to keep the payload small.
-    function buildSnapshot(movies) {
-        const people = {};
-        const items = {};
+    function createSnapshot() {
+        return { people: {}, items: {} };
+    }
 
+    function appendMoviesToSnapshot(snapshot, movies) {
+        const people = snapshot.people;
+        const items = snapshot.items;
         for (const movie of movies) {
             const cast = [];
             const seen = new Set();
@@ -365,8 +387,12 @@
             }
             items[normalizeId(movie.Id)] = [movieYear(movie), moviePlayCount(movie), movie.DateCreated || '', cast];
         }
+    }
 
-        return { people, items };
+    function buildSnapshot(movies) {
+        const snapshot = createSnapshot();
+        appendMoviesToSnapshot(snapshot, movies);
+        return snapshot;
     }
 
     function isSnapshot(value) {
@@ -450,7 +476,7 @@
         return 'jamActorsCache:v1:' + (currentServerId() || '') + ':' + (currentUserId() || '') + ':' + (parentId || 'root');
     }
 
-    function loadCache(parentId) {
+    function loadLegacyCache(parentId) {
         try {
             const raw = window.localStorage.getItem(cacheKey(parentId));
             if (!raw) {
@@ -464,16 +490,80 @@
         return null;
     }
 
-    function saveCache(parentId, roles, fingerprint, snapshot) {
+    function openCacheDatabase() {
+        if (!window.indexedDB) {
+            return Promise.reject(new Error('IndexedDB unavailable'));
+        }
+        return new Promise((resolve, reject) => {
+            const request = window.indexedDB.open(CACHE_DB_NAME, 1);
+            request.onupgradeneeded = () => {
+                request.result.createObjectStore(CACHE_STORE_NAME);
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    async function loadCache(parentId) {
         const key = cacheKey(parentId);
-        const savedAt = Date.now();
         try {
-            window.localStorage.setItem(key, JSON.stringify({ roles, fingerprint, snapshot, savedAt }));
-            return;
-        } catch (e) { /* quota — retry without the (larger) snapshot below */ }
+            const db = await openCacheDatabase();
+            const cached = await new Promise((resolve, reject) => {
+                const request = db.transaction(CACHE_STORE_NAME, 'readonly')
+                    .objectStore(CACHE_STORE_NAME)
+                    .get(key);
+                request.onsuccess = () => resolve(request.result || null);
+                request.onerror = () => reject(request.error);
+            });
+            db.close();
+            if (cached && cached.roles && cached.fingerprint) {
+                return cached;
+            }
+        } catch (err) {
+            console.debug('[actors-mvp] IndexedDB cache read failed', err);
+        }
+
+        const legacy = loadLegacyCache(parentId);
+        if (legacy) {
+            try {
+                const migrated = await saveCache(
+                    parentId,
+                    legacy.roles,
+                    legacy.fingerprint,
+                    legacy.snapshot,
+                    legacy.savedAt
+                );
+                if (migrated) {
+                    window.localStorage.removeItem(key);
+                }
+            } catch (err) {
+                console.debug('[actors-mvp] legacy cache migration failed', err);
+            }
+        }
+        return legacy;
+    }
+
+    async function saveCache(parentId, roles, fingerprint, snapshot, savedAt) {
+        const key = cacheKey(parentId);
+        const record = { roles, fingerprint, snapshot, savedAt: savedAt || Date.now() };
         try {
-            window.localStorage.setItem(key, JSON.stringify({ roles, fingerprint, savedAt }));
+            const db = await openCacheDatabase();
+            await new Promise((resolve, reject) => {
+                const request = db.transaction(CACHE_STORE_NAME, 'readwrite')
+                    .objectStore(CACHE_STORE_NAME)
+                    .put(record, key);
+                request.onsuccess = () => resolve();
+                request.onerror = () => reject(request.error);
+            });
+            db.close();
+            return true;
+        } catch (err) {
+            console.debug('[actors-mvp] IndexedDB cache write failed', err);
+        }
+        try {
+            window.localStorage.setItem(key, JSON.stringify(record));
         } catch (e) { /* quota / unavailable — non-fatal */ }
+        return false;
     }
 
     function sameFingerprint(a, b) {
@@ -651,6 +741,8 @@
             P + ' .jam-group-count{opacity:.55;font-weight:400;font-size:.9em;}',
             P + ' .jam-group-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));',
             'gap:18px;align-content:start;padding:16px 0 4px;}',
+            P + ' .jam-show-more{display:block;margin:10px auto 0;padding:8px 14px;border-radius:6px;',
+            'border:1px solid rgba(127,127,127,.4);background:rgba(127,127,127,.08);color:inherit;cursor:pointer;}',
             P + ' .jam-group.collapsed .jam-group-grid{display:none;}',
             P + ' .jam-card{display:flex;flex-direction:column;gap:8px;cursor:pointer;',
             'background:transparent;border:none;color:inherit;text-align:center;padding:0;}',
@@ -871,8 +963,9 @@
 
         group.classList.toggle('collapsed', !!state.collapsed[groupKey]);
 
+        const visible = actors.slice(0, state.visibleCards[groupKey]);
         const frag = document.createDocumentFragment();
-        for (const actor of actors) {
+        for (const actor of visible) {
             frag.appendChild(buildActorCard(actor));
         }
         grid.innerHTML = '';
@@ -883,6 +976,12 @@
             grid.appendChild(empty);
         } else {
             grid.appendChild(frag);
+        }
+        const more = group.querySelector('.jam-show-more');
+        if (more) {
+            const remaining = actors.length - visible.length;
+            more.hidden = remaining <= 0;
+            more.textContent = 'Show ' + Math.min(INITIAL_GROUP_CARD_COUNT, remaining) + ' more';
         }
     }
 
@@ -913,6 +1012,7 @@
             '      <span class="jam-group-count">0</span>',
             '    </button>',
             '    <div class="jam-group-grid"></div>',
+            '    <button type="button" class="jam-show-more" hidden></button>',
             '  </div>'
         ].join('');
     }
@@ -1016,6 +1116,17 @@
                 render(page);
             });
         }
+        for (const more of page.querySelectorAll('.jam-show-more')) {
+            more.addEventListener('click', () => {
+                const group = more.closest('.jam-group');
+                const key = group && group.getAttribute('data-group');
+                if (!key) {
+                    return;
+                }
+                state.visibleCards[key] += INITIAL_GROUP_CARD_COUNT;
+                render(page);
+            });
+        }
 
         document.body.appendChild(page);
         positionPage(page);
@@ -1098,7 +1209,8 @@
 
         if (state.loading && state.parentId === parentId) {
             if (page) {
-                setStatus(page, 'Loading movies\u2026');
+                applyLoadedData(page);
+                setStatus(page, 'Showing partial results\u2026');
             }
             return;
         }
@@ -1122,7 +1234,7 @@
             // Persistent cache (survives restarts): use it if a cheap fingerprint
             // check shows the library hasn't changed.
             if (!force) {
-                const cached = loadCache(parentId);
+                const cached = await loadCache(parentId);
                 if (cached) {
                     state.rolesData = cached.roles;
                     state.fingerprint = cached.fingerprint;
@@ -1141,20 +1253,54 @@
             if (page) {
                 setStatus(page, state.loaded ? 'Refreshing\u2026' : 'Loading movies\u2026');
             }
-            const movies = await fetchMoviesWithPeople(parentId, (loaded, total) => {
+            state.snapshot = createSnapshot();
+            state.rolesData = {};
+            state.actors = [];
+            let partialRenderHandle = null;
+            let latestProgress = null;
+
+            function renderPartial() {
+                partialRenderHandle = null;
+                state.rolesData = aggregateFromSnapshot(state.snapshot);
+                markDataLoaded();
+                const p = document.getElementById(PAGE_ID);
+                if (p && isCurrentActorsPage(p, parentId)) {
+                    applyLoadedData(p);
+                    if (latestProgress) {
+                        setStatus(p, 'Showing partial results \u2014 scanned '
+                            + latestProgress.loaded + ' / ' + latestProgress.total + ' movies');
+                    }
+                }
+            }
+
+            function schedulePartialRender() {
+                if (partialRenderHandle !== null) {
+                    return;
+                }
+                partialRenderHandle = requestAnimationFrame(renderPartial);
+            }
+
+            await fetchMoviesWithPeople(parentId, (loaded, total) => {
+                latestProgress = { loaded, total };
                 const p = document.getElementById(PAGE_ID);
                 if (p) {
-                    setStatus(p, 'Scanning movies\u2026 ' + loaded + '/' + total);
+                    setStatus(p, 'Showing partial results \u2014 scanned ' + loaded + ' / ' + total + ' movies');
                 }
+            }, (movies) => {
+                appendMoviesToSnapshot(state.snapshot, movies);
+                schedulePartialRender();
             });
             if (state.parentId !== parentId) {
                 return;
             }
-            state.snapshot = buildSnapshot(movies);
-            state.rolesData = aggregateAllRoles(movies);
-            state.fingerprint = fingerprintFromMovies(movies);
+            if (partialRenderHandle !== null) {
+                cancelAnimationFrame(partialRenderHandle);
+                renderPartial();
+            }
+            state.rolesData = aggregateFromSnapshot(state.snapshot);
+            state.fingerprint = fingerprintFromSnapshot(state.snapshot);
             state.needsCheck = false;
-            saveCache(parentId, state.rolesData, state.fingerprint, state.snapshot);
+            await saveCache(parentId, state.rolesData, state.fingerprint, state.snapshot);
             markDataLoaded();
 
             const p = document.getElementById(PAGE_ID);
@@ -1265,7 +1411,7 @@
         }
         state.rolesData = aggregateFromSnapshot(state.snapshot);
         state.fingerprint = fingerprintFromSnapshot(state.snapshot);
-        saveCache(state.parentId, state.rolesData, state.fingerprint, state.snapshot);
+        void saveCache(state.parentId, state.rolesData, state.fingerprint, state.snapshot);
         if (page) {
             applyLoadedData(page);
         } else {
@@ -1412,6 +1558,6 @@
 
     // Exposed for headless unit testing of pure logic (no-op in the app).
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports = { fetchMoviesWithPeople, aggregateActors, aggregatePeople, aggregateAllRoles, getRolesFromMovies, roleLabel, getVisibleActors, sortActors, hasPhoto, movieYear, moviePlayCount, fingerprintFromMovies, sameFingerprint, buildSnapshot, aggregateFromSnapshot, fingerprintFromSnapshot, removeFromSnapshot, normalizeId, state };
+        module.exports = { fetchMoviesWithPeople, aggregateActors, aggregatePeople, aggregateAllRoles, getRolesFromMovies, roleLabel, getVisibleActors, sortActors, hasPhoto, movieYear, moviePlayCount, fingerprintFromMovies, sameFingerprint, createSnapshot, appendMoviesToSnapshot, buildSnapshot, aggregateFromSnapshot, fingerprintFromSnapshot, removeFromSnapshot, normalizeId, state };
     }
 })();
